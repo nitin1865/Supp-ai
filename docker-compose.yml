@@ -3,7 +3,7 @@ services:
     build: .
     container_name: fastapi_app
     ports:
-      - "8001:8000"
+      - "8010:8000"
     depends_on:
       - mongodb
 
