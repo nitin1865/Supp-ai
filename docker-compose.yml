@@ -5,8 +5,8 @@ services:
     ports:
       - "8010:8000"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - MONGO_URL=${MONGO_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      MONGO_URL: ${MONGO_URL}
     depends_on:
       - mongodb
 
