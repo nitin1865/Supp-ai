@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual Environment
+venv/
+.env/
+.env
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+*.env
+
+# Cache files
+*.pkl
+
+# Database files (if any local)
+*.db
+*.sqlite3
+
+# CSV / Data files (optional - if not needed in repo)
+*.csv
+
+# Build / Distribution
+build/
+dist/
+*.egg-info/
+
+# Testing / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Node (if frontend inside project)
+node_modules/
+
+# Secrets
+secrets.json
+config.json
+
+# MongoDB dumps
+dump/
