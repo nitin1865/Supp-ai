@@ -7,6 +7,7 @@ from enum import Enum
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING
 from datetime import datetime
+import uuid
 import pandas as pd
 import os
 import openai
@@ -14,11 +15,11 @@ import re
 import logging
 from dotenv import load_dotenv
 
-# ─── Logging ───────────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Env ───────────────────────────────────────────────────────────────────────
+# ─── Env ──────────────────────────────────────────────────────────────────────
 load_dotenv()
 openai_api_key  = os.getenv("OPENAI_API_KEY")
 MONGODB_URL     = os.getenv("MONGODB_URL")
@@ -32,11 +33,11 @@ if not MONGODB_URL:
 client_openai = openai.OpenAI(api_key=openai_api_key)
 MODEL = "gpt-4o-mini"
 
-# ─── FastAPI app ───────────────────────────────────────────────────────────────
+# ─── FastAPI ──────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Personalized Meal Plan Generator API",
     description="Generate customized meal plans based on user health goals and preferences",
-    version="3.0.0",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -75,19 +76,27 @@ class Gender(str, Enum):
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
 
+# STEP 1 — Registration (email used only here)
 class RegisterRequest(BaseModel):
-    """Used by /register to create a new account. Email must be unique."""
+    """
+    Only endpoint that accepts email.
+    Returns a user_id the frontend must store and send with every future request.
+    """
     email: EmailStr
     name:  str = Field(..., min_length=1, max_length=100)
 
 class RegisterResponse(BaseModel):
     message: str
-    email:   str
+    user_id: str   # frontend stores this — sent with every subsequent request
     name:    str
 
+# STEP 2+ — All subsequent requests use user_id, never email
 class UserProfile(BaseModel):
-    """Full health profile. The email must already exist (registered via /register)."""
-    email:                  EmailStr
+    """
+    Health profile submitted after registration.
+    Uses user_id (returned by /register) — no email field.
+    """
+    user_id:                str       = Field(..., min_length=1)
     name:                   str       = Field(..., min_length=1, max_length=100)
     age:                    int       = Field(..., ge=5, le=120)
     gender:                 Gender
@@ -136,7 +145,7 @@ class MealPlanResponse(BaseModel):
 async def startup():
     global mongo_client, db, meals_df, nutrition_df
 
-    # Connect to MongoDB
+    # Connect
     try:
         mongo_client = AsyncIOMotorClient(MONGODB_URL)
         db = mongo_client[MONGODB_DB_NAME]
@@ -146,29 +155,37 @@ async def startup():
         logger.error(f"MongoDB connection failed: {e}")
         raise
 
-    # user_profiles: unique email (prevents duplicate accounts)
+    # ── Indexes ───────────────────────────────────────────────────────────────
+
+    # user_profiles.email — unique, prevents duplicate registrations
     await db.user_profiles.create_index(
         [("email", ASCENDING)],
         unique=True,
         name="unique_email_idx",
     )
-    logger.info("Unique index on user_profiles.email is ready")
 
-    # meal_plans: single-field index on user_email
-    # Makes "fetch all plans for user X" fast even with millions of rows.
-    await db.meal_plans.create_index(
-        [("user_email", ASCENDING)],
-        name="meal_plans_user_email_idx",
+    # user_profiles.user_id — unique, used for every lookup after registration
+    await db.user_profiles.create_index(
+        [("user_id", ASCENDING)],
+        unique=True,
+        name="unique_user_id_idx",
     )
-    # meal_plans: compound index (user_email + created_at DESC)
-    # Covers "get latest N plans for user X" in a single index scan.
-    await db.meal_plans.create_index(
-        [("user_email", ASCENDING), ("created_at", DESCENDING)],
-        name="meal_plans_user_created_idx",
-    )
-    logger.info("Performance indexes on meal_plans are ready")
 
-    # Load CSV files
+    # meal_plans.user_id — fast lookup of all plans for a user
+    await db.meal_plans.create_index(
+        [("user_id", ASCENDING)],
+        name="meal_plans_user_id_idx",
+    )
+
+    # meal_plans compound — "get latest N plans for user_id" in one index scan
+    await db.meal_plans.create_index(
+        [("user_id", ASCENDING), ("created_at", DESCENDING)],
+        name="meal_plans_user_id_created_at_idx",
+    )
+
+    logger.info("All MongoDB indexes are ready")
+
+    # ── CSV data ──────────────────────────────────────────────────────────────
     try:
         if os.path.exists("meal.csv"):
             meals_df = pd.read_csv("meal.csv")
@@ -176,14 +193,14 @@ async def startup():
                 meals_df = meals_df.drop(columns=["Unnamed: 0"])
             logger.info(f"Loaded {len(meals_df)} meals from meal.csv")
         else:
-            logger.warning("meal.csv not found — meal filtering will be skipped")
+            logger.warning("meal.csv not found")
             meals_df = pd.DataFrame()
 
         if os.path.exists("nutrition_data.csv"):
             nutrition_df = pd.read_csv("nutrition_data.csv")
             logger.info(f"Loaded {len(nutrition_df)} items from nutrition_data.csv")
         else:
-            logger.warning("nutrition_data.csv not found — will use AI for calorie estimates")
+            logger.warning("nutrition_data.csv not found — AI fallback will be used")
             nutrition_df = pd.DataFrame()
     except Exception as e:
         logger.error(f"Error loading CSV data: {e}")
@@ -196,59 +213,65 @@ async def shutdown():
         mongo_client.close()
         logger.info("MongoDB connection closed")
 
-# ─── MongoDB helper functions ─────────────────────────────────────────────────
+# ─── MongoDB helpers ──────────────────────────────────────────────────────────
 
-async def register_user(email: str, name: str) -> str:
+async def db_register_user(email: str, name: str) -> str:
     """
-    Insert a brand-new user document.
-    The unique index on 'email' makes MongoDB reject duplicates automatically.
-    Raises HTTP 409 if the email is already registered.
+    Create a new user document.
+    - Generates a UUID as user_id.
+    - Stores email (lowercase) for duplicate checking only.
+    - Raises 409 if email already registered.
+    - Returns the new user_id string.
     """
+    user_id = str(uuid.uuid4())
     try:
-        result = await db.user_profiles.insert_one({
-            "email":      email,          # stored lowercase — see /register endpoint
+        await db.user_profiles.insert_one({
+            "user_id":    user_id,
+            "email":      email,           # lowercase, stored for uniqueness only
             "name":       name,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         })
-        logger.info(f"New user registered: {email}")
-        return str(result.inserted_id)
+        logger.info(f"Registered new user: {email} -> user_id={user_id}")
+        return user_id
     except Exception as e:
         if "11000" in str(e) or "duplicate key" in str(e).lower():
             raise HTTPException(
                 status_code=409,
-                detail=f"Email '{email}' is already registered. Please use a different email.",
+                detail=f"Email '{email}' is already registered.",
             )
         raise
 
 
-async def save_user_profile(user_profile: UserProfile) -> None:
+async def db_save_user_profile(user_profile: UserProfile) -> None:
     """
-    Update an existing user's health profile, matched by email.
-    Raises HTTP 404 if the email doesn't exist (not registered yet).
-    upsert=False ensures we never silently create a duplicate.
+    Update an existing user's health profile, matched by user_id.
+    Raises 404 if user_id does not exist.
+    upsert=False — never silently create a new document.
     """
     doc = user_profile.model_dump()
     doc["updated_at"] = datetime.utcnow()
 
     result = await db.user_profiles.update_one(
-        {"email": user_profile.email},
+        {"user_id": user_profile.user_id},
         {"$set": doc},
-        upsert=False,   # IMPORTANT: never create — must register first
+        upsert=False,
     )
     if result.matched_count == 0:
         raise HTTPException(
             status_code=404,
-            detail=f"No account found for '{user_profile.email}'. Register first via POST /register.",
+            detail=f"user_id '{user_profile.user_id}' not found. Register first via POST /register.",
         )
 
 
-async def save_meal_plan(user_email: str, meal_plan_data: dict) -> str:
+async def db_save_meal_plan(user_id: str, meal_plan_data: dict) -> str:
     """
-    Insert a new meal plan record (history is kept — one document per generation).
+    Insert a new meal plan record linked to user_id.
+    History is preserved — one document per generation.
+    Returns the inserted document _id as a string.
     """
     result = await db.meal_plans.insert_one({
-        "user_email":    user_email,
+        "user_id":       user_id,
         "meal_plan":     meal_plan_data.get("meal_plan"),
         "bmi":           meal_plan_data.get("bmi"),
         "bmr":           meal_plan_data.get("bmr"),
@@ -258,7 +281,21 @@ async def save_meal_plan(user_email: str, meal_plan_data: dict) -> str:
     })
     return str(result.inserted_id)
 
-# ─── Business logic helpers ───────────────────────────────────────────────────
+
+async def db_get_user(user_id: str) -> dict:
+    """
+    Fetch user document by user_id.
+    Raises 404 if not found.
+    """
+    user = await db.user_profiles.find_one({"user_id": user_id})
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail=f"user_id '{user_id}' not found. Register first via POST /register.",
+        )
+    return user
+
+# ─── Business logic ───────────────────────────────────────────────────────────
 
 def calculate_bmi(weight_kg: float, height_cm: float) -> float:
     return round(weight_kg / (height_cm / 100) ** 2, 1)
@@ -275,10 +312,10 @@ def get_calories_for_food(food_name: str, quantity_grams: int) -> Dict:
             ]
             if not matches.empty:
                 row = matches.iloc[0]
-                c = float(row["Calories"])
-                f = float(row["Fat(g)"])
-                b = float(row["Carbs(g)"])
-                p = float(row["Protein(g)"])
+                c, f, b, p = (
+                    float(row["Calories"]), float(row["Fat(g)"]),
+                    float(row["Carbs(g)"]), float(row["Protein(g)"])
+                )
                 q = quantity_grams
                 return {
                     "found":             True,
@@ -295,6 +332,7 @@ def get_calories_for_food(food_name: str, quantity_grams: int) -> Dict:
     return _estimate_calories_ai(food_name, quantity_grams)
 
 def _estimate_calories_ai(food_name: str, quantity_grams: int) -> Dict:
+    """Fallback: ask OpenAI for nutrition info. Returns found=False on any error."""
     prompt = (
         f"Estimate nutritional info for {quantity_grams}g of {food_name}.\n"
         "Respond ONLY in this exact format, no other text:\n"
@@ -322,6 +360,7 @@ def _estimate_calories_ai(food_name: str, quantity_grams: int) -> Dict:
     except Exception as e:
         logger.error(f"Unexpected error (calorie estimate): {e}")
         return {"found": False, "calories": None, "food_name": food_name, "quantity": quantity_grams}
+
     try:
         text  = resp.choices[0].message.content.strip()
         cal   = re.search(r"Calories:\s*(\d+)",   text)
@@ -377,14 +416,11 @@ def _build_meal_plan(user_profile: UserProfile) -> Dict:
                         user_profile.age, user_profile.gender.value)
 
     if bmi < 18.5:
-        calorie_range = f"{int(bmr * 1.15)}-{int(bmr * 1.30)}"
-        calorie_goal  = "ABOVE BMR"
+        calorie_range, calorie_goal = f"{int(bmr*1.15)}-{int(bmr*1.30)}", "ABOVE BMR"
     elif bmi >= 25:
-        calorie_range = f"{int(bmr * 0.75)}-{int(bmr * 0.90)}"
-        calorie_goal  = "BELOW BMR"
+        calorie_range, calorie_goal = f"{int(bmr*0.75)}-{int(bmr*0.90)}", "BELOW BMR"
     else:
-        calorie_range = f"{int(bmr * 0.95)}-{int(bmr * 1.05)}"
-        calorie_goal  = "AROUND BMR"
+        calorie_range, calorie_goal = f"{int(bmr*0.95)}-{int(bmr*1.05)}", "AROUND BMR"
 
     meals_list = _filter_meals(user_profile).to_string(index=False)
     prompt = f"""Expert dietitian: Create 5-meal plan.
@@ -412,7 +448,7 @@ Dinner: [Name] (cal, P, C, F) - reason"""
             max_tokens=400,
         )
     except openai.RateLimitError as e:
-        logger.error(f"OpenAI rate limit reached: {e}")
+        logger.error(f"OpenAI rate limit: {e}")
         raise HTTPException(status_code=429, detail="OpenAI rate limit reached. Please try again in a moment.")
     except openai.AuthenticationError as e:
         logger.error(f"OpenAI authentication failed: {e}")
@@ -426,6 +462,7 @@ Dinner: [Name] (cal, P, C, F) - reason"""
     except Exception as e:
         logger.error(f"Unexpected error calling OpenAI: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error generating meal plan.")
+
     return {
         "meal_plan":     resp.choices[0].message.content.strip(),
         "bmi":           bmi,
@@ -446,11 +483,11 @@ def parse_meal_calories(meal_text: str) -> Dict[str, int]:
                 break
     return result
 
-# ─── API Endpoints ────────────────────────────────────────────────────────────
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"message": "Meal Plan Generator API", "status": "running", "version": "3.0.0"}
+    return {"message": "Meal Plan Generator API", "status": "running", "version": "4.0.0"}
 
 
 @app.get("/health", tags=["Health"])
@@ -473,20 +510,27 @@ async def health_check():
 @app.post("/register", response_model=RegisterResponse, tags=["Users"])
 async def register(request: RegisterRequest):
     """
-    Create a new user account.
+    **Step 1 — Create an account.**
 
-    Rules:
-    - Email is the unique identifier — two users cannot share the same email.
-    - Email is stored in lowercase so Alice@gmail.com == alice@gmail.com.
-    - Returns HTTP 409 if the email is already taken.
+    - Email is accepted here and nowhere else.
+    - Email is stored lowercase (Alice@gmail.com == alice@gmail.com).
+    - Returns a **user_id** (UUID). The frontend must store this and send it
+      with every subsequent API call.
+    - Returns **409** if the email is already registered.
 
-    After registering, use the same email in /generate-meal-plan.
+    ```
+    POST /register
+    { "email": "alice@example.com", "name": "Alice" }
+
+    Response:
+    { "user_id": "550e8400-e29b-41d4-a716-446655440000", "name": "Alice", ... }
+    ```
     """
-    email = request.email.lower().strip()
-    await register_user(email, request.name)
+    email   = request.email.lower().strip()
+    user_id = await db_register_user(email, request.name)
     return RegisterResponse(
-        message="Registration successful! You can now use /generate-meal-plan.",
-        email=email,
+        message="Registration successful! Save your user_id — you will need it for all future requests.",
+        user_id=user_id,
         name=request.name,
     )
 
@@ -494,18 +538,31 @@ async def register(request: RegisterRequest):
 @app.post("/generate-meal-plan", response_model=MealPlanResponse, tags=["Meal Planning"])
 async def create_meal_plan(request: MealPlanRequest):
     """
-    Generate a personalized meal plan.
+    **Step 2 — Generate a personalized meal plan.**
 
-    - The `email` inside `user_profile` must already be registered via /register.
-    - Returns HTTP 404 if the email is not found.
-    - Updates the user profile in MongoDB and saves a new meal plan record.
+    - Requires `user_id` (returned by `/register`) inside `user_profile`.
+    - No email needed.
+    - Returns **404** if `user_id` is not found.
+    - Updates the user's health profile and saves the generated plan to MongoDB.
+
+    ```
+    POST /generate-meal-plan
+    {
+      "user_profile": {
+        "user_id": "550e8400-...",
+        "name": "Alice",
+        "age": 28,
+        ...
+      }
+    }
+    ```
     """
-    # Always normalise email before any DB operation
-    request.user_profile.email = request.user_profile.email.lower().strip()
+    # Verify user exists before doing any expensive work
+    await db_get_user(request.user_profile.user_id)
 
     result = _build_meal_plan(request.user_profile)
-    await save_user_profile(request.user_profile)
-    await save_meal_plan(request.user_profile.email, result)
+    await db_save_user_profile(request.user_profile)
+    await db_save_meal_plan(request.user_profile.user_id, result)
     return MealPlanResponse(**result)
 
 
@@ -515,6 +572,7 @@ async def modify_plan(request: MealModificationRequest):
     Swap one meal in an existing plan.
 
     Body: `meal_plan` (current text), `modification` (what to change).
+    No user_id needed — operates only on the plan text provided.
     """
     if meals_df.empty:
         raise HTTPException(status_code=500, detail="Meal data not loaded")
@@ -553,7 +611,7 @@ Dinner: [name] (cal) - reason"""
             max_tokens=300,
         )
     except openai.RateLimitError as e:
-        logger.error(f"OpenAI rate limit reached: {e}")
+        logger.error(f"OpenAI rate limit: {e}")
         raise HTTPException(status_code=429, detail="OpenAI rate limit reached. Please try again in a moment.")
     except openai.AuthenticationError as e:
         logger.error(f"OpenAI authentication failed: {e}")
@@ -576,6 +634,7 @@ async def adjust_plan(request: MealAdjustmentRequest):
     Re-balance the plan when the user eats something outside it.
 
     Body: `meal_plan`, `food_name`, `quantity_grams`, `meal_replaced`.
+    No user_id needed — operates only on the plan text provided.
     """
     if meals_df.empty:
         raise HTTPException(status_code=500, detail="Meal data not loaded")
@@ -621,7 +680,7 @@ Dinner: {food_info['food_name']} ({food_info['calories']}kcal) - consumed"""
             max_tokens=300,
         )
     except openai.RateLimitError as e:
-        logger.error(f"OpenAI rate limit reached: {e}")
+        logger.error(f"OpenAI rate limit: {e}")
         raise HTTPException(status_code=429, detail="OpenAI rate limit reached. Please try again in a moment.")
     except openai.AuthenticationError as e:
         logger.error(f"OpenAI authentication failed: {e}")
@@ -640,7 +699,7 @@ Dinner: {food_info['food_name']} ({food_info['calories']}kcal) - consumed"""
 
 @app.post("/get-food-calories", response_model=CalorieInfo, tags=["Nutrition"])
 async def get_food_calories(food_name: str, quantity_grams: int):
-    """Calorie + macro lookup. Query params: food_name, quantity_grams."""
+    """Calorie + macro lookup. Query params: `food_name`, `quantity_grams`."""
     return get_calories_for_food(food_name, quantity_grams)
 
 
