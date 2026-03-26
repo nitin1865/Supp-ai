@@ -6,6 +6,9 @@ services:
       - "8010:8000"
     env_file:
       - .env
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MONGODB_URL=${MONGODB_URL}
     depends_on:
       - mongodb
 
